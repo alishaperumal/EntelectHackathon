@@ -1,345 +1,149 @@
-// Level 1 Solution
-// Uses helper functions from ../constants.js
+/**
+ * Entelect Grand Prix - Level 1 Solver
+ *
+ * Key discovery from simulator logs:
+ *   tyre_friction = life_span * weather_multiplier
+ *                 = 1.0 * 1.18 = 1.18  (Soft tyre, dry weather)
+ *
+ * NOT baseFrictionCoefficient * multiplier as the PDF might imply.
+ * The life_span value (1.0) IS the starting friction value, not a separate
+ * "count of sets". The baseFrictionCoefficient in constants.js is not used
+ * by the simulator for max corner speed calculation.
+ *
+ * Strategy:
+ *   - Use Soft tyres (best friction in dry, and tyres don't degrade in Level 1)
+ *   - Target speed = 90 m/s (max) on every straight
+ *   - Brake point: ceil((90^2 - exitSpeed^2) / (2 * 20)) metres before end
+ *   - Exit speed calculated to be safely below maxCornerSpeed of the next
+ *     corner (or the minimum across a chain of consecutive corners)
+ */
 
-const fs = require("fs");
-const path = require("path");
+const fs = require('fs');
+const path = require('path');
 
-// ── Load constants & helpers from root constants.js ──────────────────────────
-// (inline here so the file runs standalone — mirrors constants.js exactly)
+// ─── Load race config ────────────────────────────────────────────────────────
+const configPath = path.join(__dirname, '..', 'levels', '1.txt');
+const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 
-const CONSTANTS = {
-  K_STRAIGHT:   0.0000166,
-  K_BRAKING:    0.0398,
-  K_CORNER:     0.000265,
-  FUEL_K_BASE:  0.0005,
-  FUEL_K_DRAG:  0.0000000015,
-  GRAVITY:      9.8,
-};
+const car       = config.car;
+const race      = config.race;
+const segments  = config.track.segments;
+const ACCEL     = car['accel_m/se2'];          // 10
+const BRAKE     = car['brake_m/se2'];          // 20
+const MAX_SPEED = car['max_speed_m/s'];        // 90
+const CRAWL     = car['crawl_constant_m/s'];   // 10
+const GRAVITY   = 9.8;
+const TOTAL_LAPS = race.laps;                  // 50
 
-// From constants.js ── calcMaxCornerSpeed
-function calcMaxCornerSpeed(tyreFriction, cornerRadius, crawlConstant) {
-  return Math.sqrt(tyreFriction * CONSTANTS.GRAVITY * cornerRadius) + crawlConstant;
+// ─── Tyre selection ──────────────────────────────────────────────────────────
+// Soft tyre: life_span = 1, dry_friction_multiplier = 1.18
+// Tyres don't degrade in Level 1, so friction stays constant.
+const CHOSEN_TYRE_ID = 1;   // id:1 → Soft compound
+const TYRE_LIFE_SPAN = 1.0;
+const DRY_MULTIPLIER = 1.18;
+const TYRE_FRICTION  = TYRE_LIFE_SPAN * DRY_MULTIPLIER;  // 1.18
+
+// ─── Physics helpers ─────────────────────────────────────────────────────────
+
+/** Maximum safe entry speed for a corner given current tyre friction */
+function maxCornerSpeed(radius) {
+  return Math.sqrt(TYRE_FRICTION * GRAVITY * radius) + CRAWL;
 }
 
-// From constants.js ── calcCurrentTyreFriction
-function calcCurrentTyreFriction(baseFriction, totalDegradation, weatherMultiplier) {
-  return (baseFriction - totalDegradation) * weatherMultiplier;
-}
-
-// From constants.js ── calcDistanceGivenFinalSpeed (used for brake/accel distances)
-function calcDistanceGivenFinalSpeed(initialSpeed, finalSpeed, acceleration) {
-  return (Math.pow(finalSpeed, 2) - Math.pow(initialSpeed, 2)) / (2 * acceleration);
-}
-
-// From constants.js ── calcBaseScore
-function calcBaseScore(timeReference, actualRaceTime) {
-  return 500000 * Math.pow(timeReference / actualRaceTime, 3);
-}
-
-// ── Read input ────────────────────────────────────────────────────────────────
-const inputPath = path.join(__dirname, "../levels/1.txt");
-const inputData = fs.readFileSync(inputPath, "utf8");
-const data = JSON.parse(inputData);
-
-// ── Parse car ─────────────────────────────────────────────────────────────────
-const car = {
-  maxSpeed:        data.car["max_speed_m/s"],
-  accel:           data.car["accel_m/se2"],
-  brake:           data.car["brake_m/se2"],
-  limpSpeed:       data.car["limp_constant_m/s"],
-  crawlSpeed:      data.car["crawl_constant_m/s"],
-  tankCapacity:    data.car["fuel_tank_capacity_l"],
-  initialFuel:     data.car["initial_fuel_l"],
-  fuelConsumption: data.car["fuel_consumption_l/m"],
-};
-
-// ── Parse race ────────────────────────────────────────────────────────────────
-const race = {
-  name:              data.race.name,
-  laps:              data.race.laps,
-  basePitTime:       data.race["base_pit_stop_time_s"],
-  tyrSwapTime:       data.race["pit_tyre_swap_time_s"],
-  refuelRate:        data.race["pit_refuel_rate_l/s"],
-  crashPenalty:      data.race["corner_crash_penalty_s"],
-  pitExitSpeed:      data.race["pit_exit_speed_m/s"],
-  fuelSoftCap:       data.race["fuel_soft_cap_limit_l"],
-  startingWeatherId: data.race["starting_weather_condition_id"],
-  timeReference:     data.race["time_reference_s"],
-};
-
-// ── Parse track ───────────────────────────────────────────────────────────────
-const segments = data.track.segments;
-const straights = segments.filter((s) => s.type === "straight");
-const corners   = segments.filter((s) => s.type === "corner");
-
-// ── Parse tyres ───────────────────────────────────────────────────────────────
-const tyreProperties = data.tyres.properties;
-const availableSets  = data.available_sets;
-
-// Build tyre ID → compound lookup
-const tyreIdToCompound = {};
-for (const set of availableSets) {
-  for (const id of set.ids) {
-    tyreIdToCompound[id] = set.compound;
-  }
-}
-
-// ── Parse weather ─────────────────────────────────────────────────────────────
-const weatherConditions = data.weather.conditions;
-const weatherById = {};
-for (const w of weatherConditions) {
-  weatherById[w.id] = w;
-}
-
-// ── Helper: map weather condition string → multiplier key ────────────────────
-function weatherKey(conditionStr) {
-  switch (conditionStr) {
-    case "dry":        return "dry";
-    case "cold":       return "cold";
-    case "light_rain": return "lightRain";
-    case "heavy_rain": return "heavyRain";
-    default:           return "dry";
-  }
-}
-
-// ── Step 1: Select best tyre for current weather ──────────────────────────────
-// Level 1: weather is dry for 100 000s (entire race). No degradation in Level 1.
-// Best tyre = highest effective friction = baseFriction * weatherMultiplier
-
-const currentWeather = weatherById[race.startingWeatherId];
-const wKey = weatherKey(currentWeather.condition);
-
-let bestCompound = null;
-let bestFriction = -Infinity;
-
-for (const [compound, props] of Object.entries(tyreProperties)) {
-  // Level 1: no degradation, so totalDegradation = 0
-  const friction = calcCurrentTyreFriction(
-    // baseFrictionCoefficient from TYRE_PROPERTIES table (not in JSON, use hardcoded table)
-    { Soft: 1.8, Medium: 1.7, Hard: 1.6, Intermediate: 1.2, Wet: 1.1 }[compound],
-    0, // no degradation
-    props[`${wKey}_friction_multiplier`]
-  );
-  if (friction > bestFriction) {
-    bestFriction = friction;
-    bestCompound = compound;
-  }
-}
-
-// Find the tyre ID for the chosen compound
-const chosenSet  = availableSets.find((s) => s.compound === bestCompound);
-const initialTyreId = chosenSet.ids[0];
-
-console.log(`Best compound: ${bestCompound} (friction=${bestFriction.toFixed(4)}, ID=${initialTyreId})`);
-
-// ── Step 2: Compute max safe speed for each corner ────────────────────────────
-// Formula: sqrt(tyreFriction * gravity * radius) + crawlSpeed
-// Use 99% of max as a safety margin to guarantee no crash penalty.
-
-const SAFETY_MARGIN = 0.99;
-
-const cornerMaxSpeed = {}; // segmentId → safe entry speed (integer m/s)
-for (const corner of corners) {
-  const maxSpd = calcMaxCornerSpeed(bestFriction, corner.radius_m, car.crawlSpeed);
-  cornerMaxSpeed[corner.id] = Math.floor(maxSpd * SAFETY_MARGIN);
-}
-
-console.log("\nCorner safe speeds:");
-for (const corner of corners) {
-  console.log(`  Seg ${corner.id} (r=${corner.radius_m}m): ${cornerMaxSpeed[corner.id]} m/s`);
-}
-
-// ── Step 3: Plan each straight ────────────────────────────────────────────────
-// For each straight we need:
-//   target_m/s           — highest speed we can reach given entry/exit constraints
-//   brake_start_m_before_next — metres from end of straight where braking begins
-//
-// Physics:
-//   accel distance = (vTarget² - vEntry²) / (2 * accel)    [calcDistanceGivenFinalSpeed]
-//   brake distance = (vTarget² - vExit²)  / (2 * brake)    [same formula, negative accel]
-//   constraint: accelDist + brakeDist <= straightLength
-
-function planStraight(entrySpeed, straightLength, exitSpeed) {
-  const vEntry = Math.min(entrySpeed, car.maxSpeed);
-  const vExit  = Math.min(exitSpeed,  car.maxSpeed);
-
-  // Binary search for the highest integer target speed that fits
-  let lo = Math.max(vEntry, vExit, car.crawlSpeed);
-  let hi = car.maxSpeed;
-
-  for (let i = 0; i < 64; i++) {
-    const mid = (lo + hi) / 2;
-    // accelDist: distance to accelerate from vEntry → mid (0 if mid <= vEntry)
-    const accelDist = mid > vEntry
-      ? calcDistanceGivenFinalSpeed(vEntry, mid, car.accel)
-      : 0;
-    // brakeDist: distance to decelerate from mid → vExit (0 if mid <= vExit)
-    const brakeDist = mid > vExit
-      ? calcDistanceGivenFinalSpeed(vExit, mid, car.brake)  // (mid²-vExit²)/(2*brake)
-      : 0;
-
-    if (accelDist + brakeDist <= straightLength) {
-      lo = mid;
+/**
+ * For a straight at segments[segIdx], look ahead through any consecutive
+ * corners that immediately follow it and return the minimum max corner speed.
+ * This is the speed the car must be doing as it exits the straight.
+ */
+function requiredExitSpeed(segIdx) {
+  let minSpeed = MAX_SPEED;
+  for (let i = segIdx + 1; i < segments.length; i++) {
+    const seg = segments[i];
+    if (seg.type === 'corner') {
+      const cs = maxCornerSpeed(seg.radius_m);
+      if (cs < minSpeed) minSpeed = cs;
     } else {
-      hi = mid;
+      break;
     }
   }
+  return minSpeed;
+}
 
-  const vTarget = Math.min(Math.floor(lo), car.maxSpeed);
+/**
+ * Build the segment actions for a single straight.
+ *
+ * target_m/s  : always MAX_SPEED (90)
+ * brake_start : ceil of braking distance so exit speed ≤ requiredExit
+ *               Using ceil guarantees the car decelerates enough even with
+ *               floating-point rounding.
+ */
+function straightActions(segIdx) {
+  const seg      = segments[segIdx];
+  const exitNeeded = requiredExitSpeed(segIdx);
+  const target   = MAX_SPEED;
 
-  // Exact brake distance for the chosen target speed
-  const brakeDist = vTarget > vExit
-    ? calcDistanceGivenFinalSpeed(vExit, vTarget, car.brake)
-    : 0;
-
-  // Round up braking start so we never arrive at corner too fast
+  // Distance needed to brake from target down to exitNeeded
+  // v² = u² − 2·a·s  →  s = (u² − v²) / (2·a)
+  const brakeDist = (target * target - exitNeeded * exitNeeded) / (2 * BRAKE);
   const brakeStart = Math.ceil(brakeDist);
 
   return {
-    "target_m/s":                 vTarget,
-    brake_start_m_before_next:    Math.min(brakeStart, straightLength),
+    id: seg.id,
+    type: 'straight',
+    'target_m/s': target,
+    brake_start_m_before_next: brakeStart,
   };
 }
 
-// ── Step 4: Build one lap's segment list ──────────────────────────────────────
-// We need the entry speed for each segment, which chains from the previous one.
-// - Race starts at 0 m/s (lap 1 only)
-// - Subsequent laps start at the exit speed of the last segment (a corner)
-
-function buildLapSegments(lapStartSpeed) {
-  const segmentPlan = [];
-  let currentSpeed = lapStartSpeed;
-
-  for (let i = 0; i < segments.length; i++) {
-    const seg     = segments[i];
-    const nextSeg = segments[(i + 1) % segments.length];
-
-    if (seg.type === "straight") {
-      // Required exit speed = MINIMUM safe speed across the entire consecutive corner chain.
-      // e.g. Seg 9 → Seg 10 (r=95, 54 m/s) → Seg 11 (r=44, 40 m/s)
-      // We must arrive at 40 m/s because there is no straight between 10 and 11 to brake.
-      let exitSpeed = car.crawlSpeed;
-      if (nextSeg.type === "corner") {
-        exitSpeed = cornerMaxSpeed[nextSeg.id];
-        // Walk forward through any consecutive corners to find the tightest one
-        let j = (i + 2) % segments.length;
-        while (segments[j].type === "corner") {
-          exitSpeed = Math.min(exitSpeed, cornerMaxSpeed[segments[j].id]);
-          j = (j + 1) % segments.length;
-          if (j === i) break; // safety: full loop guard
-        }
-      }
-
-      const strat = planStraight(currentSpeed, seg.length_m, exitSpeed);
-
-      segmentPlan.push({
-        id:   seg.id,
-        type: "straight",
-        ...strat,
-      });
-
-      currentSpeed = exitSpeed; // We arrive at next segment at this speed
-
-    } else {
-      // Corner: constant speed, no decision needed in submission JSON
-      segmentPlan.push({ id: seg.id, type: "corner" });
-      currentSpeed = cornerMaxSpeed[seg.id];
-    }
-  }
-
-  return { segmentPlan, exitSpeed: currentSpeed };
+/** Build the segment action for a corner (no parameters needed for L1) */
+function cornerActions(seg) {
+  return { id: seg.id, type: 'corner' };
 }
 
-// ── Step 5: Simulate lap times for score estimate ─────────────────────────────
-function estimateLapTime(segmentPlan, lapStartSpeed) {
-  let time  = 0;
-  let speed = lapStartSpeed;
+// ─── Build lap template (same every lap) ─────────────────────────────────────
+const lapTemplate = segments.map((seg, i) =>
+  seg.type === 'straight' ? straightActions(i) : cornerActions(seg)
+);
 
-  for (let i = 0; i < segments.length; i++) {
-    const seg  = segments[i];
-    const plan = segmentPlan.find((p) => p.id === seg.id);
-
-    if (seg.type === "straight") {
-      const vTarget    = plan["target_m/s"];
-      const brakeStart = plan.brake_start_m_before_next;
-      const nextSeg    = segments[(i + 1) % segments.length];
-      const vExit      = nextSeg.type === "corner" ? cornerMaxSpeed[nextSeg.id] : car.crawlSpeed;
-
-      let dist = seg.length_m;
-
-      // Acceleration phase
-      if (vTarget > speed) {
-        const accelDist = calcDistanceGivenFinalSpeed(speed, vTarget, car.accel);
-        const accelTime = (vTarget - speed) / car.accel;
-        dist  -= Math.min(accelDist, dist);
-        time  += accelTime;
-        speed  = vTarget;
-      }
-
-      // Cruise phase (everything before braking starts)
-      const cruiseDist = Math.max(0, dist - brakeStart);
-      if (cruiseDist > 0 && speed > 0) {
-        time += cruiseDist / speed;
-        dist -= cruiseDist;
-      }
-
-      // Braking phase
-      if (vExit < speed) {
-        const brakeTime = (speed - vExit) / car.brake;
-        time  += brakeTime;
-        speed  = vExit;
-      }
-
-    } else {
-      // Corner at constant speed
-      const cornerSpeed = cornerMaxSpeed[seg.id];
-      time  += seg.length_m / cornerSpeed;
-      speed  = cornerSpeed;
-    }
-  }
-
-  return time;
-}
-
-// ── Step 6: Assemble submission ───────────────────────────────────────────────
-const lap1Result = buildLapSegments(0);
-const lapNResult = buildLapSegments(lap1Result.exitSpeed); // steady-state from lap 2+
-
+// ─── Build full submission ────────────────────────────────────────────────────
 const laps = [];
-for (let lapNum = 1; lapNum <= race.laps; lapNum++) {
-  const plan = lapNum === 1 ? lap1Result : lapNResult;
+for (let lap = 1; lap <= TOTAL_LAPS; lap++) {
   laps.push({
-    lap:      lapNum,
-    segments: plan.segmentPlan,
-    pit:      { enter: false },
+    lap,
+    segments: lapTemplate.map(s => ({ ...s })),
+    pit: { enter: false },
   });
 }
 
-const submission = { initial_tyre_id: initialTyreId, laps };
+const submission = {
+  initial_tyre_id: CHOSEN_TYRE_ID,
+  laps,
+};
 
-// ── Step 7: Write output.txt ──────────────────────────────────────────────────
-const outputPath = path.join(__dirname, "output.txt");
-fs.writeFileSync(outputPath, JSON.stringify(submission, null, 2), "utf8");
-console.log("\nOutput written to output.txt");
+// ─── Write output ─────────────────────────────────────────────────────────────
+const outPath = path.join(__dirname, 'output.txt');
+fs.writeFileSync(outPath, JSON.stringify(submission, null, 2));
+console.log(`Output written to ${outPath}`);
 
-// ── Step 8: Print diagnostics ─────────────────────────────────────────────────
-console.log("\n--- Straight plan (Lap 1, entry=0 m/s) ---");
-for (const s of lap1Result.segmentPlan.filter((p) => p.type === "straight")) {
-  console.log(`  Seg ${s.id}: target=${s["target_m/s"]} m/s, brake=${s.brake_start_m_before_next}m before end`);
-}
-
-console.log(`\n--- Straight plan (Lap 2+, entry=${lap1Result.exitSpeed} m/s) ---`);
-for (const s of lapNResult.segmentPlan.filter((p) => p.type === "straight")) {
-  console.log(`  Seg ${s.id}: target=${s["target_m/s"]} m/s, brake=${s.brake_start_m_before_next}m before end`);
-}
-
-const t1 = estimateLapTime(lap1Result.segmentPlan, 0);
-const tN = estimateLapTime(lapNResult.segmentPlan, lap1Result.exitSpeed);
-const totalTime = t1 + tN * (race.laps - 1);
-const score = calcBaseScore(race.timeReference, totalTime);
-
-console.log(`\n--- Time estimate ---`);
-console.log(`  Lap 1  : ${t1.toFixed(2)}s`);
-console.log(`  Lap 2+ : ${tN.toFixed(2)}s`);
-console.log(`  Total  : ${totalTime.toFixed(2)}s  (reference: ${race.timeReference}s)`);
-console.log(`  Estimated base score: ${Math.round(score).toLocaleString()}`);
+// ─── Quick sanity simulation ──────────────────────────────────────────────────
+console.log('\n=== Lap 1 sanity simulation ===');
+let speed = 0;
+let penaltyCount = 0;
+segments.forEach((seg, i) => {
+  if (seg.type === 'straight') {
+    const act = lapTemplate[i];
+    const brakeStart = act.brake_start_m_before_next;
+    const target     = act['target_m/s'];
+    // Exit speed after braking from target for brakeStart metres
+    const exitSpeedSq = target * target - 2 * BRAKE * brakeStart;
+    const exitSpeed   = Math.sqrt(Math.max(0, exitSpeedSq));
+    console.log(`  S${seg.id}: target=${target} brake@${brakeStart}m exit=${exitSpeed.toFixed(3)}`);
+    speed = exitSpeed;
+  } else {
+    const maxSpd  = maxCornerSpeed(seg.radius_m);
+    const penalty = speed > maxSpd;
+    if (penalty) penaltyCount++;
+    console.log(`  C${seg.id} (r=${seg.radius_m}): entry=${speed.toFixed(3)} max=${maxSpd.toFixed(3)} ${penalty ? 'PENALTY!' : 'OK'}`);
+    if (penalty) speed = CRAWL;
+  }
+});
