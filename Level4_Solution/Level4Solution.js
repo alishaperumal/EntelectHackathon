@@ -129,10 +129,11 @@ function weatherTargetSpeed(weatherCondition, compound) {
 }
 
 // ─── NEW: Future weather prediction ───────────────────────────────
-function getLowestFutureFriction(compound, currentTime, windowSec = 20) {
+
+// FIX: Increased lookahead window to 60s to ensure we catch weather changes
+// that might happen across multiple consecutive long corners.
+function getLowestFutureFriction(compound, currentTime, windowSec = 60) {
   let minFriction = Infinity;
-  // Sample the weather every 2 seconds for the next 'windowSec'
-  // to catch any sudden drops in tyre grip before we hit a corner
   for (let t = 0; t <= windowSec; t += 2) {
     const w = weatherAtTime(currentTime + t);
     minFriction = Math.min(minFriction, getFriction(compound, w.condition));
@@ -140,11 +141,22 @@ function getLowestFutureFriction(compound, currentTime, windowSec = 20) {
   return minFriction;
 }
 
+// FIX: Added a function to find the worst-case deceleration multiplier in the future.
+// This prevents the car from braking too late if the weather gets worse during the straight.
+function getLowestFutureDecel(currentTime, windowSec = 60) {
+  let minDecel = Infinity;
+  for (let t = 0; t <= windowSec; t += 2) {
+    const w = weatherAtTime(currentTime + t);
+    minDecel = Math.min(minDecel, w.deceleration_multiplier);
+  }
+  return minDecel;
+}
+
 function getRequiredExit(segIdx, compound, currentTime) {
   let minRequiredSpeed = Infinity;
 
-  // Use the worst-case friction we might experience in the next 20 seconds
-  const safeFriction = getLowestFutureFriction(compound, currentTime, 20);
+  // FIX: Using the expanded 60-second window here
+  const safeFriction = getLowestFutureFriction(compound, currentTime, 60);
 
   // Look ahead at all segments after the current straight
   for (let j = segIdx + 1; j < segments.length; j++) {
@@ -178,7 +190,11 @@ function simulateLap(entrySpeed, weatherTargets, compound, initialTime) {
     const target = weatherTargets.get(wObj.condition) || MAX_SPEED;
 
     const effAccel = ACCEL * wObj.acceleration_multiplier;
-    const effBrake = BRAKE * wObj.deceleration_multiplier;
+
+    // FIX: Base braking distance on the worst-case future multiplier
+    // instead of current multiplier so you don't run out of braking space.
+    const safeDecelMult = getLowestFutureDecel(initialTime + time, 60);
+    const effBrake = BRAKE * safeDecelMult;
 
     if (seg.type === "straight") {
       // Use the look-ahead logic to prep for upcoming corners with future weather
@@ -416,7 +432,7 @@ function evaluate(weatherTargets) {
 }
 
 // ─── Main optimisation ────────────────────────────────────────────
-console.log("=== Level 3 Solver: Spa-Francorchamps ===\n");
+console.log("=== Level 4 Solver: Monaco ===\n");
 console.log(`Weather cycle (starting from ID ${START_WEATHER_ID}):`);
 WEATHER_CYCLE.forEach((w) => {
   console.log(
