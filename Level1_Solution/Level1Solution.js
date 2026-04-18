@@ -1,4 +1,6 @@
 // Level 1 Solution
+// Uses helper functions from ../constants.js
+
 const fs = require("fs");
 const path = require("path");
 
@@ -213,10 +215,20 @@ function buildLapSegments(lapStartSpeed) {
     const nextSeg = segments[(i + 1) % segments.length];
 
     if (seg.type === "straight") {
-      // Required exit speed = max safe speed of the very next corner
-      const exitSpeed = nextSeg.type === "corner"
-        ? cornerMaxSpeed[nextSeg.id]
-        : car.crawlSpeed; // Straight→Straight is unusual; be conservative
+      // Required exit speed = MINIMUM safe speed across the entire consecutive corner chain.
+      // e.g. Seg 9 → Seg 10 (r=95, 54 m/s) → Seg 11 (r=44, 40 m/s)
+      // We must arrive at 40 m/s because there is no straight between 10 and 11 to brake.
+      let exitSpeed = car.crawlSpeed;
+      if (nextSeg.type === "corner") {
+        exitSpeed = cornerMaxSpeed[nextSeg.id];
+        // Walk forward through any consecutive corners to find the tightest one
+        let j = (i + 2) % segments.length;
+        while (segments[j].type === "corner") {
+          exitSpeed = Math.min(exitSpeed, cornerMaxSpeed[segments[j].id]);
+          j = (j + 1) % segments.length;
+          if (j === i) break; // safety: full loop guard
+        }
+      }
 
       const strat = planStraight(currentSpeed, seg.length_m, exitSpeed);
 
